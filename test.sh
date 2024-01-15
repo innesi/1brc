@@ -49,3 +49,4 @@ for sample in $(ls $INPUT); do
 done
 
 rm measurements.txt
+ln -s measurements.orig measurements.txt
