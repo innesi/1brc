@@ -15,46 +15,49 @@
  */
 package dev.morling.onebrc;
 
-import static java.util.stream.Collectors.*;
-
-import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
-import java.io.StringReader;
 import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.util.DoubleSummaryStatistics;
+import java.util.Locale;
 import java.util.Map;
-import java.util.TreeMap;
-import java.util.stream.Collector;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.stream.Collectors;
-
-/**
- * i5-5200U / 16GB / SATA SSD
- * Baseline : 6m8,445s
- * Naive : 5m59,698s
- */
 
 public class CalculateAverage_innesi {
 
-    private static final String FILE = "./measurements.txt";
+    private final static File FILE = new File("measurements.txt");
 
-    public static void main(String[] args) throws IOException {
-
-        BufferedReader buffReader = new BufferedReader(new StringReader(FILE));
-        Map<String, DoubleSummaryStatistics> mesures = new TreeMap<>();
-
-        String line = null;
-        while ((line = buffReader.readLine()) != null) {
-            String ct[] = line.split(";");
-            if (mesures.containsKey(ct[0])) {
-                mesures.get(ct[0]).accept(Double.parseDouble(ct[1]));
-            } else {
-                DoubleSummaryStatistics dss = new DoubleSummaryStatistics();
-                dss.accept(Double.parseDouble(ct[1])); 
-                mesures.put(ct[0], dss);
-            }
+    private class Temperature extends DoubleSummaryStatistics {
+        @Override
+        public String toString() {
+            return String.format(Locale.US, "%.1f/%.1f/%.1f", this.getMin(),
+                    this.getAverage(), this.getMax());
         }
+    }
 
-        System.out.println(mesures);
+    public static void main(String[] args) {
+        try {
+            Map<String, Temperature> measures = Files.lines(FILE.toPath())
+                    .parallel()
+                    .map(line -> line.split(";"))
+                    .collect(Collectors.toMap(
+                            ct -> ct[0],
+                            ct -> {
+                                Temperature temperature = new CalculateAverage_innesi().new Temperature();
+                                temperature.accept(Double.parseDouble(ct[1]));
+                                return temperature;
+                            },
+                            (temp1, temp2) -> {
+                                temp1.combine(temp2);
+                                return temp1;
+                            },
+                            ConcurrentSkipListMap::new));
+
+            System.out.println(measures);
+        }
+        catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 }
