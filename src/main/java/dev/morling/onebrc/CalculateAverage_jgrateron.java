@@ -20,29 +20,28 @@ import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Queue;
-import java.util.Map.Entry;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 public class CalculateAverage_jgrateron {
     private static final String FILE = "./measurements.txt";
-    private static final int MAX_LENGTH_LINE = 115;
+    private static final int MAX_LENGTH_LINE = 255;
     private static final int MAX_BUFFER = 1024 * 8;
     private static boolean DEBUG = false;
+    public static int DECENAS[] = { 0, 10, 20, 30, 40, 50, 60, 70, 80, 90 };
+    public static int CENTENAS[] = { 0, 100, 200, 300, 400, 500, 600, 700, 800, 900 };
 
     public record Particion(long offset, long size) {
     }
 
-    public record Tupla(String str, double num) {
-    }
-
     /*
-     * 
+     * Divide el archivo segun el nro de cores de la PC
+     * La division se debe recalcular hasta encontrar un \n o \r (enter o return)
      */
     public static List<Particion> dividirArchivo(File archivo) throws IOException {
         var particiones = new ArrayList<Particion>();
@@ -86,39 +85,37 @@ public class CalculateAverage_jgrateron {
         return particiones;
     }
 
+    /*
+     * cambiar el locale para que el separador decimal sea punto y no coma
+     * crear un hilo por cada particion
+     * totalizar las mediciones por cada hilo
+     * ordenar y mostrar
+     */
     public static void main(String[] args) throws InterruptedException, IOException {
         Locale.setDefault(Locale.US);
         var startTime = System.nanoTime();
         var archivo = new File(FILE);
-        var totalMediciones = new HashMap<Integer, Medicion>();
         var tareas = new ArrayList<Thread>();
+        var totalMediciones = new HashMap<Index, Medicion>();
         var particiones = dividirArchivo(archivo);
 
         for (var p : particiones) {
             var hilo = Thread.ofVirtual().start(() -> {
-                var mediciones = new HashMap<Integer, Medicion>();
-                try (var miArchivo = new MiArchivo(archivo)) {
-                    miArchivo.seek(p);
-                    for (;;) {
-                        var tuples = miArchivo.readTuples();
-                        if (tuples.isEmpty()) {
-                            break;
-                        }
-                        for (;;) {
-                            var tuple = tuples.poll();
-                            if (tuple == null) {
-                                break;
-                            }
-                            var estacion = tuple.str;
-                            var temp = tuple.num;
-                            var hashCode = estacion.hashCode();
-                            var medicion = mediciones.get(hashCode);
+                try (var miTarea = new MiTarea(archivo, p)) {
+                    var mediciones = miTarea.calcularMediciones();
+                    for (var entry : mediciones.entrySet()) {
+                        Medicion medicion;
+                        synchronized (totalMediciones) {
+                            medicion = totalMediciones.get(entry.getKey());
                             if (medicion == null) {
-                                medicion = new Medicion(estacion, 1, temp, temp, temp);
-                                mediciones.put(hashCode, medicion);
+                                totalMediciones.put(entry.getKey(), entry.getValue());
+                                medicion = entry.getValue();
                             }
-                            else {
-                                medicion.update(1, temp, temp, temp);
+                        }
+                        synchronized (medicion) {
+                            if (!medicion.equals(entry.getValue())) {
+                                var otraMed = entry.getValue();
+                                medicion.update(otraMed.count, otraMed.tempMin, otraMed.tempMax, otraMed.tempSum);
                             }
                         }
                     }
@@ -126,31 +123,20 @@ public class CalculateAverage_jgrateron {
                 catch (IOException e) {
                     System.exit(-1);
                 }
-                synchronized (totalMediciones) {
-                    for (var entry : mediciones.entrySet()) {
-                        var medicion = totalMediciones.get(entry.getKey());
-                        if (medicion == null) {
-                            totalMediciones.put(entry.getKey(), entry.getValue());
-                        }
-                        else {
-                            var otraMed = entry.getValue();
-                            medicion.update(otraMed.count, otraMed.tempMin, otraMed.tempMax, otraMed.tempSum);
-                        }
-                    }
-                }
             });
             tareas.add(hilo);
         }
+
+        Comparator<Map.Entry<Index, Medicion>> comparar = (a, b) -> {
+            return a.getValue().getNombreEstacion().compareTo(b.getValue().getNombreEstacion());
+        };
+
         for (var hilo : tareas) {
             hilo.join();
         }
 
-        Comparator<Entry<Integer, Medicion>> comparar = (a, b) -> {
-            return a.getValue().estacion.compareTo(b.getValue().estacion);
-        };
-
         var result = totalMediciones.entrySet().stream()//
-                .sorted(comparar)//
+                .sorted(comparar)
                 .map(e -> e.getValue().toString())//
                 .collect(Collectors.joining(", "));
 
@@ -158,59 +144,77 @@ public class CalculateAverage_jgrateron {
         if (DEBUG) {
             System.out.println("Total: " + (System.nanoTime() - startTime) / 1000000 + "ms");
         }
-
     }
 
     /*
-     * 
+     * Clase Index para reutilizar al realizar un get en el Map
      */
-    public static double strToDouble(byte linea[], int posSeparator, int len) {
-        double number[] = { 0, 0 };
-        int pos = 0;
-        boolean esNegativo = false;
-        for (int i = posSeparator + 1; i < len; i++) {
-            switch (linea[i]) {
-                case '0', '1', '2', '3', '4':
-                case '5', '6', '7', '8', '9':
-                    number[pos] = number[pos] * 10;
-                    number[pos] = number[pos] + (linea[i] - 48);
-                    break;
-                case '-':
-                    esNegativo = true;
-                    break;
-                case '.':
-                    pos = 1;
-                    break;
+    static class Index {
+        private int hash;
+        private byte[] data;
+        private int fromIndex;
+        private int length;
+
+        public Index() {
+            this.hash = 0;
+        }
+
+        public Index(byte data[], int fromIndex, int length) {
+            this.data = data;
+            this.fromIndex = fromIndex;
+            this.length = length;
+            this.hash = calcHashCode(length, data, fromIndex, length);
+        }
+
+        public void setData(byte data[], int fromIndex, int length) {
+            this.data = data;
+            this.fromIndex = fromIndex;
+            this.length = length;
+            this.hash = calcHashCode(length, data, fromIndex, length);
+        }
+
+        /*
+         * Calcula el hash de cada estacion,
+         * variation of Daniel J Bernstein's algorithm
+         */
+        private int calcHashCode(int result, byte[] a, int fromIndex, int length) {
+            int end = fromIndex + length;
+            for (int i = fromIndex; i < end; i++) {
+                result = ((result << 5) + result) ^ a[i];
             }
+            return result;
         }
-        double num = number[0];
-        if (number[1] > 0) {
-            num += (number[1] / 10);
+
+        @Override
+        public int hashCode() {
+            return hash;
         }
-        if (esNegativo) {
-            num = num * -1;
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            var otro = (Index) obj;
+            return Arrays.equals(this.data, this.fromIndex, this.fromIndex + this.length, otro.data, otro.fromIndex,
+                    otro.fromIndex + otro.length);
         }
-        return num;
     }
 
     /*
-     * 
+     * Clase para procesar el archivo a la particion que corresponde
+     * RandomAccessFile permite dezplazar el puntero de lectura del archivo
+     * Tenemos un Map para guardar las estadisticas y un map para guardar los
+     * nombres de las estaciones
      */
-    static class MiArchivo implements AutoCloseable {
+    static class MiTarea implements AutoCloseable {
         private final RandomAccessFile rFile;
-        private final byte buffer[] = new byte[MAX_BUFFER];
-        private final byte line[] = new byte[MAX_LENGTH_LINE];
-        private final byte rest[] = new byte[MAX_LENGTH_LINE];
-        private int lenRest = 0;
-        private long maxRead = 0;
-        private long totalRead = 0;
-        private Queue<Tupla> tuples = new LinkedList<Tupla>();
+        private long maxRead;
+        private Index index = new Index();
+        private Map<Index, Medicion> mediciones = new HashMap<>();
 
-        public MiArchivo(File file) throws IOException {
+        public MiTarea(File file, Particion particion) throws IOException {
             rFile = new RandomAccessFile(file, "r");
-        }
-
-        public void seek(Particion particion) throws IOException {
             maxRead = particion.size;
             rFile.seek(particion.offset);
         }
@@ -220,70 +224,123 @@ public class CalculateAverage_jgrateron {
             rFile.close();
         }
 
-        public Queue<Tupla> readTuples() throws IOException {
-            if (totalRead == maxRead) {
-                return tuples;
-            }
-            long numBytes = rFile.read(buffer);
-            if (numBytes == -1) {
-                return tuples;
-            }
-            var totalLeidos = totalRead + numBytes;
-            if (totalLeidos > maxRead) {
-                numBytes = maxRead - totalRead;
-            }
-            totalRead += numBytes;
-            int pos = 0;
-            int len = 0;
-            int idx = 0;
-            while (pos < numBytes) {
-                if (buffer[pos] == '\n' || buffer[pos] == '\r') {
-                    if (lenRest > 0) {
-                        System.arraycopy(rest, 0, line, 0, lenRest);
-                        System.arraycopy(buffer, idx, line, lenRest, len);
-                        len += lenRest;
-                        lenRest = 0;
+        /*
+         * Lee solo su particion
+         * Divide el buffer por lineas usando los separadores \n o \r (enter o return)
+         * obtiene la posicion de separacion ";" de la estacion y su temperatura
+         * calcula el hash, convierte a double y actualiza las estadisticas
+         */
+        public Map<Index, Medicion> calcularMediciones() throws IOException {
+            var buffer = new byte[MAX_BUFFER];// buffer para lectura en el archivo
+            var rest = new byte[MAX_LENGTH_LINE];// Resto que sobra en cada lectura del buffer
+            var lenRest = 0;// Longitud que sobró en cada lectura del buffer
+            var totalRead = 0l; // Total bytes leidos
+
+            for (;;) {
+                if (totalRead == maxRead) {
+                    break;
+                }
+                long numBytes = rFile.read(buffer);
+                if (numBytes == -1) {
+                    break;
+                }
+                numBytes = totalRead + numBytes > maxRead ? maxRead - totalRead : numBytes;
+                totalRead += numBytes;
+                int pos = 0;
+                int len = 0;
+                int idx = 0;
+                int semicolon = 0;
+                while (pos < numBytes) {
+                    var b = buffer[pos];
+                    if (b == '\n' || b == '\r') {
+                        if (lenRest > 0) {
+                            // concatenamos el sobrante anterior con la nueva linea
+                            System.arraycopy(buffer, idx, rest, lenRest, len);
+                            len += lenRest;
+                            semicolon = buscarSemicolon(rest, len);
+                            lenRest = 0;
+                            updateMediciones(rest, 0, semicolon);
+                        }
+                        else {
+                            updateMediciones(buffer, idx, semicolon);
+                        }
+                        idx = pos + 1;
+                        len = 0;
+                        semicolon = 0;
                     }
                     else {
-                        System.arraycopy(buffer, idx, line, 0, len);
-                    }
-                    int semicolon = 0;
-                    for (int i = 0; i < len; i++) {
-                        if (line[i] == ';') {
-                            semicolon = i;
-                            break;
+                        if (b == ';') {
+                            semicolon = len;
                         }
+                        len++;
                     }
-                    var temperatura = strToDouble(line, semicolon, len);
-                    var tupla = new Tupla(new String(line, 0, semicolon), temperatura);
-                    tuples.add(tupla);
-                    idx = pos + 1;
-                    len = 0;
+                    pos++;
                 }
-                else {
-                    len++;
+                if (len > 0) {
+                    System.arraycopy(buffer, idx, rest, 0, len);
+                    lenRest = len;
                 }
-                pos++;
             }
-            if (len > 0) {
-                System.arraycopy(buffer, idx, rest, 0, len);
-                lenRest = len;
+            return mediciones;
+        }
+
+        /*
+         * Buscamos en reverso ya que el ; esta mas cerca de numero que la estacion
+         * ademas el minimo numero 0.0 asi que quitamos tres mas
+         */
+        public int buscarSemicolon(byte data[], int len) {
+            for (int i = len - 4; i >= 0; i--) {
+                if (data[i] == ';') {
+                    return i;
+                }
             }
-            return tuples;
+            return 0;
+        }
+
+        /*
+         * Busca una medicion por su hash y crea o actualiza la temperatura
+         */
+        public void updateMediciones(byte data[], int pos, int semicolon) {
+            var temp = strToInt(data, pos, semicolon);
+            index.setData(data, pos, semicolon);
+            var medicion = mediciones.get(index);
+            if (medicion == null) {
+                var estacion = new byte[semicolon];
+                System.arraycopy(data, pos, estacion, 0, semicolon);
+                medicion = new Medicion(estacion, 1, temp, temp, temp);
+                mediciones.put(new Index(estacion, 0, semicolon), medicion);
+            }
+            else {
+                medicion.update(1, temp, temp, temp);
+            }
+        }
+
+        /*
+         * convierte de un arreglo de bytes a integer
+         */
+
+        public int strToInt(byte linea[], int idx, int posSeparator) {
+            int pos = idx + posSeparator + 1;
+            boolean esNegativo = linea[pos] == '-';
+            pos = esNegativo ? pos + 1 : pos;
+            int number = linea[pos + 1] == '.' ? DECENAS[(linea[pos] - 48)] + linea[pos + 2] - 48
+                    : CENTENAS[(linea[pos] - 48)] + DECENAS[(linea[pos + 1] - 48)] + (linea[pos + 3] - 48);
+            return esNegativo ? -number : number;
         }
     }
 
     /*
-     * 
+     * Clase para reservar las estadisticas por estacion
      */
     static class Medicion {
-        private String estacion;
         private int count;
-        private double tempMin;
-        private double tempMax;
-        private double tempSum;
+        private int tempMin;
+        private int tempMax;
+        private int tempSum;
+        private byte estacion[];
+        private String nombreEstacion;
 
-        public Medicion(String estacion, int count, double tempMin, double tempMax, double tempSum) {
+        public Medicion(byte estacion[], int count, int tempMin, int tempMax, int tempSum) {
             super();
             this.estacion = estacion;
             this.count = count;
@@ -292,21 +349,31 @@ public class CalculateAverage_jgrateron {
             this.tempSum = tempSum;
         }
 
-        public void update(int count, double tempMin, double tempMax, double tempSum) {
+        public void update(int count, int tempMin, int tempMax, int tempSum) {
             this.count += count;
-            if (tempMin < this.tempMin) {
-                this.tempMin = tempMin;
-            }
-            if (tempMax > this.tempMax) {
-                this.tempMax = tempMax;
-            }
+            this.tempMin = Math.min(tempMin, this.tempMin);
+            this.tempMax = Math.max(tempMax, this.tempMax);
             this.tempSum += tempSum;
+        }
+
+        public double round(double number) {
+            return Math.round(number) / 10.0;
+        }
+
+        public String getNombreEstacion() {
+            if (nombreEstacion == null) {
+                nombreEstacion = new String(estacion);
+            }
+            return nombreEstacion;
         }
 
         @Override
         public String toString() {
-            double tempPro = tempSum / count;
-            return "%s=%.1f/%.1f/%.1f".formatted(estacion, tempMin, tempPro, tempMax);
+            var min = round(tempMin);
+            var mid = round(1.0 * tempSum / count);
+            var max = round(tempMax);
+            var nombre = getNombreEstacion();
+            return "%s=%.1f/%.1f/%.1f".formatted(nombre, min, mid, max);
         }
     }
 }
